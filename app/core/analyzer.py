@@ -197,10 +197,134 @@ class DocumentAnalyzer:
             logger.debug(f"Full vector store cache error: {str(e)}", exc_info=True)
             return None
 
-    async def process_document(self, file_path: str, question_ids: List[int] = None) -> AsyncGenerator[Dict, None]:
-        """Process document and analyze TCFD questions"""
+    async def score_chunk_relevance(self, question: str, chunk_text: str) -> float:
+        """Score the relevance of a chunk to a question using LLM, following DIRAS methodology."""
+        log_analysis_step(f"Computing relevance score for chunk: {chunk_text[:100]}...")
+        
+        messages = [
+            {"role": "system", "content": """You are an expert at evaluating text relevance for question answering systems.
+Your task is to score how relevant a given text chunk is for answering a specific question.
+
+Evaluate based on:
+1. Direct relevance to the question topic and requirements
+2. Presence of specific, factual information that helps answer the question
+3. Quality and usefulness of the context provided
+4. Completeness of information relative to what the question asks
+
+Output only a float score between 0.0 and 1.0 where:
+0.0 = Completely irrelevant or no useful information
+0.5 = Partially relevant or contains some useful context
+1.0 = Highly relevant with specific, direct information
+
+Return only the numeric score, no explanation."""},
+            {"role": "user", "content": f"""Question: {question}
+
+Text chunk to evaluate:
+{chunk_text}
+
+Score (0.0-1.0):"""}
+        ]
+        
+        try:
+            # Use our existing LLM instance
+            result = await self.llm.ainvoke(messages)
+            # Extract float from response
+            score = float(result.content.strip())
+            # Ensure score is between 0 and 1
+            score = max(0.0, min(1.0, score))
+            log_analysis_step(f"Computed relevance score: {score:.4f}")
+            return score
+        except Exception as e:
+            log_analysis_step(f"Error scoring chunk relevance: {str(e)}", "error")
+            return 0.0
+
+    async def score_chunk_relevance_batch(self, question: str, chunks: List[Dict], single_call: bool = True) -> List[float]:
+        """Score the relevance of chunks to a question.
+        
+        Args:
+            question (str): The question to evaluate against
+            chunks (List[Dict]): List of chunks to evaluate
+            single_call (bool): If True (default), score all chunks in one LLM call.
+                              If False, process chunks in smaller batches.
+        """
+        log_analysis_step(f"Computing relevance scores for {len(chunks)} chunks...")
+        
+        if single_call:
+            # Process all chunks in a single LLM call
+            formatted_chunks = "\n\n".join([
+                f"Chunk {i+1}:\n{chunk['text']}"
+                for i, chunk in enumerate(chunks)
+            ])
+            
+            messages = [
+                {"role": "system", "content": """You are an expert at evaluating text relevance for question answering systems.
+Your task is to score how relevant each text chunk is for answering a specific question.
+
+For each chunk, evaluate:
+1. Direct relevance to the question topic and requirements
+2. Presence of specific, factual information that helps answer the question
+3. Quality and usefulness of the context provided
+
+Provide a float score between 0.0 and 1.0 where:
+0.0 = Completely irrelevant
+0.5 = Partially relevant
+1.0 = Highly relevant with specific information
+
+Return ONLY a JSON object with scores array, like:
+{
+    "scores": [0.8, 0.3, 0.9]  # one score per chunk in order
+}"""},
+                {"role": "user", "content": f"""Question: {question}
+
+Text chunks to evaluate:
+{formatted_chunks}
+
+Return scores JSON:"""}
+            ]
+            
+            try:
+                result = await self.llm.ainvoke(messages)
+                result_text = result.content.strip()
+                json_start = result_text.find('{')
+                json_end = result_text.rfind('}') + 1
+                if json_start >= 0 and json_end > json_start:
+                    result_text = result_text[json_start:json_end]
+                
+                scores_json = json.loads(result_text)
+                scores = scores_json.get("scores", [0.0] * len(chunks))
+                
+                # Ensure scores are valid floats between 0 and 1
+                scores = [max(0.0, min(1.0, float(score))) for score in scores]
+                log_analysis_step(f"Processed all {len(chunks)} chunks in single call")
+                return scores
+                
+            except Exception as e:
+                log_analysis_step(f"Error scoring chunks: {str(e)}", "error")
+                return [0.0] * len(chunks)
+        else:
+            # Process in smaller batches (fallback mode)
+            BATCH_SIZE = 5
+            chunk_batches = [chunks[i:i + BATCH_SIZE] for i in range(0, len(chunks), BATCH_SIZE)]
+            all_scores = []
+            
+            for batch in chunk_batches:
+                batch_scores = await self._score_chunk_batch(question, batch)
+                all_scores.extend(batch_scores)
+            
+            return all_scores
+
+    async def process_document(self, file_path: str, question_ids: List[int], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
+        """Process document and analyze TCFD questions.
+        
+        Args:
+            file_path (str): Path to the document
+            question_ids (List[int]): List of question IDs to analyze
+            use_llm_scoring (bool): Whether to use LLM for scoring chunk relevance
+            single_call (bool): If True, score all chunks in one LLM call
+        """
         log_analysis_step(f"Starting document processing: {file_path}")
         log_analysis_step(f"Processing questions: {question_ids}")
+        log_analysis_step(f"LLM scoring enabled: {use_llm_scoring}")
         
         try:
             # Initial status
@@ -265,10 +389,11 @@ class DocumentAnalyzer:
             for q_id in question_ids:
                 question_key = f"tcfd_{q_id}"
                 if question_key not in self.questions:
+                    log_analysis_step(f"Skipping unknown question ID: {q_id}")
                     continue
                 
                 question_data = self.questions[question_key]
-                log_analysis_step(f"Processing question {q_id}")
+                log_analysis_step(f"Processing question {q_id} (key: {question_key})")
                 yield {"status": f"Analyzing question {q_id}"}
                 
                 try:
@@ -283,6 +408,27 @@ class DocumentAnalyzer:
                     # Prepare chunks data for passing to frontend
                     chunks_data = [{"text": d.text, "metadata": d.metadata, "relevance_score": float(s)} 
                                  for d, s in docs_and_scores]
+                    
+                    # Add LLM-based relevance scoring if enabled
+                    if use_llm_scoring:
+                        log_analysis_step(f"Starting LLM-based relevance scoring for question {q_id}")
+                        yield {"status": f"Scoring chunk relevance for question {q_id}..."}
+                        
+                        computed_scores = await self.score_chunk_relevance_batch(
+                            question_data['text'],
+                            chunks_data,
+                            single_call=single_call
+                        )
+                        
+                        scored_chunks = [
+                            {**chunk, "computed_score": float(score)}
+                            for chunk, score in zip(chunks_data, computed_scores)
+                        ]
+                        
+                        chunks_data = scored_chunks
+                        log_analysis_step(f"Completed scoring {len(chunks_data)} chunks")
+                    else:
+                        log_analysis_step(f"Skipping LLM-based relevance scoring for question {q_id} (scoring is disabled)")
                     
                     # Get LLM response
                     messages = self.prompt_manager.get_analysis_messages(

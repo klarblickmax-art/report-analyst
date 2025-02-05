@@ -64,11 +64,12 @@ class TCFDAnalyzer:
             logger.error("Failed to load questions from analyzer")
             self.questions = {}
     
-    async def analyze_document(self, file_path: str, selected_questions: List[str]) -> AsyncGenerator[Dict, None]:
+    async def analyze_document(self, file_path: str, selected_questions: List[int], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
         """Analyze a document for TCFD compliance using the real analyzer"""
         try:
             log_analysis_step(f"Starting analysis of document: {file_path}")
             log_analysis_step(f"Selected questions: {selected_questions}")
+            log_analysis_step(f"LLM scoring enabled: {use_llm_scoring}")
             
             results = {
                 "answers": {},
@@ -80,11 +81,8 @@ class TCFDAnalyzer:
             if not hasattr(st.session_state, 'raw_responses'):
                 st.session_state.raw_responses = {}
             
-            # Convert question IDs to integers for the analyzer
-            question_ids = [int(q.split('_')[1]) for q in selected_questions]
-            
-            # Use process_document directly since it's already an async generator
-            async for result in self.analyzer.process_document(file_path, question_ids):
+            # Pass use_llm_scoring to process_document
+            async for result in self.analyzer.process_document(file_path, selected_questions, use_llm_scoring, single_call):
                 yield result
             
         except Exception as e:
@@ -109,7 +107,7 @@ def save_uploaded_file(uploaded_file) -> Optional[str]:
         st.error(f"Error saving file: {str(e)}")
         return None
 
-def display_results(results: Dict[str, Any], questions: Dict[str, Dict], question_id: str):
+def display_results(results: Dict[str, Any], questions: Dict[str, Dict], question_id: int):
     """Display results for a single question in a clean, organized layout"""
     try:
         # Get result components
@@ -197,7 +195,7 @@ def display_results(results: Dict[str, Any], questions: Dict[str, Dict], questio
         logger.error(f"Error displaying results for question {question_id}: {str(e)}")
         st.error(f"Error displaying results for question {question_id}")
 
-async def analyze_document_and_display(analyzer, file_path: str, selected_questions: List[str]):
+async def analyze_document_and_display(analyzer, file_path: str, selected_questions: List[int], use_llm_scoring: bool = False, single_call: bool = True):
     """Analyze document and display results as they come in"""
     try:
         results = {"answers": {}}  # Initialize results structure
@@ -205,7 +203,7 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
         results_container = st.container()
         
         # Use the async generator directly
-        async for result in analyzer.analyze_document(file_path, selected_questions):
+        async for result in analyzer.analyze_document(file_path, selected_questions, use_llm_scoring, single_call):
             if "error" in result:
                 log_analysis_step(f"Error received from analyzer: {result['error']}", "error")
                 st.error(f"Analysis error: {result['error']}")
@@ -241,18 +239,51 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
                         # Display chunks in a dataframe if available
                         result_data = results["answers"][display_id]
                         if "CHUNKS" in result_data:
+                            log_analysis_step(f"Processing chunks data for display (question {display_id})")
                             st.subheader(f"Retrieved Context Chunks for Question {display_id}")
                             chunks_df = pd.DataFrame(result_data["CHUNKS"])
+                            
                             if not chunks_df.empty:
+                                log_analysis_step(f"Found {len(chunks_df)} chunks to display")
+                                
+                                # Check for computed scores
+                                has_computed_scores = "computed_score" in chunks_df.columns
+                                log_analysis_step(f"Computed scores present: {has_computed_scores}")
+                                
                                 # Clean up the display by selecting relevant columns
-                                display_df = chunks_df[["text", "metadata", "relevance_score"]].copy()
+                                columns = ["text", "metadata", "relevance_score"]
+                                if has_computed_scores:
+                                    columns.append("computed_score")
+                                    log_analysis_step("Including computed scores in display")
+                                display_df = chunks_df[columns].copy()
+                                
                                 # Convert metadata dict to string for better display
                                 display_df["metadata"] = display_df["metadata"].apply(lambda x: json.dumps(x, indent=2))
-                                # Format relevance score
+                                
+                                # Format scores
                                 display_df["relevance_score"] = display_df["relevance_score"].apply(lambda x: f"{x:.4f}")
-                                # Sort by relevance score
-                                display_df = display_df.sort_values("relevance_score", ascending=False)
+                                if has_computed_scores:
+                                    display_df["computed_score"] = display_df["computed_score"].apply(lambda x: f"{x:.4f}")
+                                    # Sort by computed score if available
+                                    display_df = display_df.sort_values("computed_score", ascending=False)
+                                    log_analysis_step("Sorted chunks by computed score")
+                                else:
+                                    # Sort by vector similarity score
+                                    display_df = display_df.sort_values("relevance_score", ascending=False)
+                                    log_analysis_step("Sorted chunks by vector similarity")
+                                
+                                # Rename columns for better display
+                                display_df = display_df.rename(columns={
+                                    "relevance_score": "Vector Similarity",
+                                    "computed_score": "LLM Computed Score",
+                                    "text": "Content",
+                                    "metadata": "Metadata"
+                                })
+                                
+                                log_analysis_step(f"Displaying dataframe with columns: {display_df.columns.tolist()}")
                                 st.dataframe(display_df, use_container_width=True)
+                            else:
+                                log_analysis_step("Warning: Empty chunks dataframe", "warning")
             
             except json.JSONDecodeError as e:
                 log_analysis_step(f"JSON decode error for {q_id}: {str(e)}", "error")
@@ -285,10 +316,6 @@ def main():
     st.title("TCFD Report Analyzer")
     st.write("Upload a PDF report and select questions for TCFD compliance analysis.")
     
-    # Initialize session state for selected questions if not already present
-    if 'selected_questions' not in st.session_state:
-        st.session_state.selected_questions = []
-    
     try:
         # Initialize analyzer
         analyzer = TCFDAnalyzer()
@@ -311,10 +338,19 @@ def main():
                 selected_questions = []
                 for q_id, q_data in analyzer.questions.items():
                     if st.checkbox(q_data['text'], key=q_id):
-                        selected_questions.append(q_id)
+                        selected_questions.append(int(q_id.split('_')[1]))  # Convert to integer ID immediately
                 
-                # Update session state with current selections
-                st.session_state.selected_questions = selected_questions
+                # Add configuration options
+                with st.expander("Advanced Options"):
+                    use_llm_scoring = st.checkbox("Use LLM for relevance scoring", value=False)
+                    if use_llm_scoring:
+                        single_call = st.checkbox(
+                            "Score all chunks in single LLM call", 
+                            value=True,
+                            help="More efficient but may be less accurate with large numbers of chunks"
+                        )
+                    else:
+                        single_call = True
                 
                 if st.button("Analyze Document"):
                     with st.spinner("Analyzing document..."):
@@ -323,8 +359,17 @@ def main():
                         if not file_path:
                             return
                         
-                        # Run analysis using the selected questions from session state
-                        asyncio.run(analyze_document_and_display(analyzer, file_path, st.session_state.selected_questions))
+                        log_analysis_step(f"Starting analysis with LLM scoring: {use_llm_scoring}")
+                        log_analysis_step(f"Processing questions: {selected_questions}")
+                        
+                        # Run analysis using the selected questions
+                        asyncio.run(analyze_document_and_display(
+                            analyzer, 
+                            file_path, 
+                            selected_questions,  # Already integer IDs
+                            use_llm_scoring,
+                            single_call
+                        ))
             except Exception as e:
                 st.error(f"Error processing uploaded file: {str(e)}")
     except Exception as e:
