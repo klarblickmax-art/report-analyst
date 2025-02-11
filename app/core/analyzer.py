@@ -116,7 +116,8 @@ class DocumentAnalyzer:
             log_analysis_step(f"Error initializing OpenAI clients: {str(e)}", "error")
             raise
         
-        self.questions = self._load_questions()
+        self.questions = {}
+        self.question_set_prefix = "tcfd"  # Default to tcfd
         self._initialized = True
 
     def _get_cache_key(self, file_path: str) -> str:
@@ -296,7 +297,7 @@ Scores (JSON array):"""}
             return [0.0] * len(chunks)
 
     async def process_document(self, file_path: str, question_ids: List[int], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
-        """Process document and analyze TCFD questions.
+        """Process document and analyze questions.
         
         Args:
             file_path (str): Path to the document
@@ -377,7 +378,7 @@ Scores (JSON array):"""}
             
             # Process each question
             for q_id in question_ids:
-                question_key = f"tcfd_{q_id}"
+                question_key = f"{self.question_set_prefix}_{q_id}"
                 if question_key not in self.questions:
                     log_analysis_step(f"Skipping unknown question ID: {q_id}")
                     continue

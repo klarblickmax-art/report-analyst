@@ -45,7 +45,7 @@ from core.prompt_manager import PromptManager
 load_dotenv()
 logger.info("Loaded environment variables")
 
-class TCFDAnalyzer:
+class ReportAnalyzer:
     def __init__(self):
         self.temp_dir = Path("temp")
         self.temp_dir.mkdir(exist_ok=True)
@@ -54,35 +54,56 @@ class TCFDAnalyzer:
         self.analyzer = DocumentAnalyzer()
         self.prompt_manager = PromptManager()
         
-        # Get questions from the analyzer
-        self.questions = self.analyzer.questions
-        if self.questions:
-            self.name = "TCFD Questions"
-            self.description = "Task Force on Climate-related Financial Disclosures (TCFD) question set for analyzing sustainability reports"
-            logger.debug(f"Loaded {len(self.questions)} questions")
-        else:
-            logger.error("Failed to load questions from analyzer")
-            self.questions = {}
+    def load_question_set(self, question_set: str) -> Dict:
+        """Load questions from the specified question set file"""
+        question_file = Path(__file__).parent / "questionsets" / f"{question_set}_questions.yaml"
+        try:
+            with open(question_file, 'r') as f:
+                data = yaml.safe_load(f)
+                # Create questions with proper IDs
+                questions = {}
+                for i, q in enumerate(data['questions'], 1):  # Start from 1
+                    q_id = f"{question_set}_{i}"
+                    questions[q_id] = q
+                    # Add the ID to the question data for reference
+                    q['id'] = q_id
+                    # Add numeric ID for easier mapping
+                    q['number'] = i
+                return {
+                    "questions": questions,
+                    "name": data.get('name', f"{question_set.upper()} Questions"),
+                    "description": data.get('description', '')
+                }
+        except Exception as e:
+            logger.error(f"Failed to load questions from {question_file}: {str(e)}")
+            return {
+                "questions": {},
+                "name": "",
+                "description": ""
+            }
     
-    async def analyze_document(self, file_path: str, selected_questions: List[int], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
-        """Analyze a document for TCFD compliance using the real analyzer"""
+    async def analyze_document(self, file_path: str, questions: Dict, selected_questions: List[str], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
+        """Analyze a document using the provided questions"""
         try:
             log_analysis_step(f"Starting analysis of document: {file_path}")
             log_analysis_step(f"Selected questions: {selected_questions}")
             log_analysis_step(f"LLM scoring enabled: {use_llm_scoring}")
             
-            results = {
-                "answers": {},
-                "sources": {},
-                "page_numbers": {}
-            }
+            # Update analyzer with the current questions
+            self.analyzer.questions = questions
             
-            # Store raw responses for debugging
-            if not hasattr(st.session_state, 'raw_responses'):
-                st.session_state.raw_responses = {}
+            # Convert selected question IDs to numbers for the analyzer
+            selected_numbers = [questions[q_id]['number'] for q_id in selected_questions]
+            
+            # Get the question set prefix from the first selected question
+            question_set = selected_questions[0].split('_')[0] if selected_questions else "tcfd"
+            self.analyzer.question_set_prefix = question_set
             
             # Pass use_llm_scoring to process_document
-            async for result in self.analyzer.process_document(file_path, selected_questions, use_llm_scoring, single_call):
+            async for result in self.analyzer.process_document(file_path, selected_numbers, use_llm_scoring, single_call):
+                # Convert question number back to ID if needed
+                if 'question_number' in result:
+                    result['question_id'] = f"{question_set}_{result['question_number']}"
                 yield result
             
         except Exception as e:
@@ -164,7 +185,7 @@ def display_results(results: Dict[str, Any], questions: Dict[str, Dict], questio
     except Exception as e:
         st.error(f"Error displaying results: {str(e)}")
 
-async def analyze_document_and_display(analyzer, file_path: str, selected_questions: List[int], use_llm_scoring: bool = False, single_call: bool = True):
+async def analyze_document_and_display(analyzer, file_path: str, questions: Dict, selected_questions: List[str], use_llm_scoring: bool = False, single_call: bool = True):
     """Analyze document and display results as they come in"""
     try:
         results = {"answers": {}}  # Initialize results structure
@@ -172,7 +193,7 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
         results_container = st.container()
         
         # Use the async generator directly
-        async for result in analyzer.analyze_document(file_path, selected_questions, use_llm_scoring, single_call):
+        async for result in analyzer.analyze_document(file_path, questions, selected_questions, use_llm_scoring, single_call):
             if "error" in result:
                 log_analysis_step(f"Error received from analyzer: {result['error']}", "error")
                 st.error(f"Analysis error: {result['error']}")
@@ -185,25 +206,33 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
             
             try:
                 # Process the result
-                q_id = f"tcfd_{result['question_number']}"
-                log_analysis_step(f"Processing result for question {q_id}")
+                question_id = result.get('question_id')  # Expect full question ID from analyzer
+                if question_id is None:
+                    log_analysis_step("Missing question ID in result", "error")
+                    continue
+                
+                log_analysis_step(f"Processing result for question {question_id}")
                 
                 # Store raw response for debugging
                 if not hasattr(st.session_state, 'raw_responses'):
                     st.session_state.raw_responses = {}
-                st.session_state.raw_responses[q_id] = result["result"]
+                st.session_state.raw_responses[question_id] = result["result"]
                 
                 # Parse the result - it's already in the correct format from the analyzer
-                result_json = json.loads(result["result"])
+                try:
+                    result_json = json.loads(result["result"])
+                except json.JSONDecodeError as e:
+                    log_analysis_step(f"Failed to parse JSON for {question_id}: {str(e)}", "error")
+                    continue
                 
                 # Store results
-                results["answers"][q_id] = result_json
+                results["answers"][question_id] = result_json
                 
                 # Display the updated results immediately
                 with results_container:
                     st.empty()  # Clear previous content
                     for display_id in results["answers"]:
-                        display_results(results["answers"][display_id], analyzer.questions, display_id)
+                        display_results(results["answers"][display_id], questions, display_id)
                         
                         # Display chunks in a dataframe if available
                         result_data = results["answers"][display_id]
@@ -254,12 +283,11 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
                             else:
                                 log_analysis_step("Warning: Empty chunks dataframe", "warning")
             
-            except json.JSONDecodeError as e:
-                log_analysis_step(f"JSON decode error for {q_id}: {str(e)}", "error")
-                st.error(f"Error processing result for question {q_id}")
             except Exception as e:
-                log_analysis_step(f"Unexpected error processing result for {q_id}: {str(e)}", "error")
+                log_analysis_step(f"Unexpected error processing result: {str(e)}", "error")
+                log_analysis_step(traceback.format_exc(), "error")
                 st.error(f"Error processing result: {str(e)}")
+                continue
         
         # Log final results summary
         log_analysis_step(f"Analysis complete. Processed {len(results['answers'])} questions successfully")
@@ -273,21 +301,47 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
         
     except Exception as e:
         log_analysis_step(f"Critical error during analysis: {str(e)}", "error")
+        log_analysis_step(traceback.format_exc(), "error")
         st.error(f"Error during analysis: {str(e)}")
 
 def main():
     st.set_page_config(
-        page_title="TCFD Report Analyzer",
+        page_title="Report Analyzer",
         page_icon="📊",
         layout="wide"
     )
     
-    st.title("TCFD Report Analyzer")
-    st.write("Upload a PDF report and select questions for TCFD compliance analysis.")
+    st.title("Report Analyzer")
+    st.write("Upload a PDF report and select questions for sustainability report analysis.")
     
     try:
         # Initialize analyzer
-        analyzer = TCFDAnalyzer()
+        analyzer = ReportAnalyzer()
+        
+        # Question set selection
+        question_sets = {
+            "tcfd": "TCFD (Task Force on Climate-related Financial Disclosures)",
+            "s4m": "S4M (Score4More)"
+        }
+        
+        # Use session state to track the selected question set
+        if 'current_question_set' not in st.session_state:
+            st.session_state.current_question_set = "tcfd"
+            
+        selected_set = st.selectbox(
+            "Select Question Set",
+            options=list(question_sets.keys()),
+            format_func=lambda x: question_sets[x],
+            key="question_set",
+            on_change=lambda: setattr(st.session_state, 'current_question_set', st.session_state.question_set)
+        )
+        
+        # Load the selected question set
+        question_set_data = analyzer.load_question_set(selected_set)
+        questions = question_set_data["questions"]
+        
+        if question_set_data["description"]:
+            st.write(question_set_data["description"])
         
         # File upload
         uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
@@ -298,16 +352,17 @@ def main():
                 st.write("File uploaded successfully!")
                 
                 # Display available questions
-                if not analyzer.questions:
-                    questions_path = Path(__file__).parent / "questionsets" / "tcfd_questions.yaml"
+                if not questions:
+                    questions_path = Path(__file__).parent / "questionsets" / f"{selected_set}_questions.yaml"
                     st.error(f"No questions loaded. Please check if the questions file exists at: {questions_path}")
                     return
                     
                 st.subheader("Select Questions for Analysis")
                 selected_questions = []
-                for q_id, q_data in analyzer.questions.items():
+                for q_id, q_data in questions.items():
+                    # Use the question ID directly as the checkbox key
                     if st.checkbox(q_data['text'], key=q_id):
-                        selected_questions.append(int(q_id.split('_')[1]))  # Convert to integer ID immediately
+                        selected_questions.append(q_id)  # Use the full question ID
                 
                 # Add configuration options
                 with st.expander("Advanced Options"):
@@ -328,14 +383,16 @@ def main():
                         if not file_path:
                             return
                         
-                        log_analysis_step(f"Starting analysis with LLM scoring: {use_llm_scoring}")
-                        log_analysis_step(f"Processing questions: {selected_questions}")
+                        log_analysis_step(f"Starting analysis with question set: {selected_set}")
+                        log_analysis_step(f"Selected questions: {selected_questions}")
+                        log_analysis_step(f"LLM scoring enabled: {use_llm_scoring}")
                         
                         # Run analysis using the selected questions
                         asyncio.run(analyze_document_and_display(
                             analyzer, 
-                            file_path, 
-                            selected_questions,  # Already integer IDs
+                            file_path,
+                            questions,  # Pass the full questions dictionary
+                            selected_questions,
                             use_llm_scoring,
                             single_call
                         ))
