@@ -259,7 +259,6 @@ def display_final_results(analysis_df: pd.DataFrame, chunks_df: pd.DataFrame):
     st.subheader("Analysis Results")
     st.dataframe(
         analysis_df,
-        use_container_width=True,
         column_config={
             "Score": st.column_config.NumberColumn(
                 "Score",
@@ -276,28 +275,54 @@ def display_final_results(analysis_df: pd.DataFrame, chunks_df: pd.DataFrame):
                 "Key Evidence",
                 width="medium"
             )
-        }
+        },
+        use_container_width=True,
+        hide_index=True
     )
     
     # Document Chunks
     st.subheader("Document Chunks")
     st.dataframe(
         chunks_df,
-        use_container_width=True,
         column_config={
+            "Question ID": st.column_config.SelectboxColumn(
+                "Question ID",
+                help="The question this chunk belongs to",
+                width="medium",
+                options=chunks_df["Question ID"].unique().tolist()
+            ),
             "Vector Similarity": st.column_config.NumberColumn(
                 "Vector Similarity",
+                help="Similarity score between chunk and question",
+                min_value=0,
+                max_value=1,
                 format="%.3f"
             ),
             "LLM Score": st.column_config.NumberColumn(
                 "LLM Score",
+                help="LLM-computed relevance score",
+                min_value=0,
+                max_value=1,
                 format="%.3f"
             ),
             "Chunk Text": st.column_config.TextColumn(
                 "Chunk Text",
+                help="Text content of the chunk",
                 width="large"
+            ),
+            "Evidence Reference": st.column_config.CheckboxColumn(
+                "Used as Evidence",
+                help="Whether this chunk was referenced in the analysis"
+            ),
+            "Position in Question": st.column_config.NumberColumn(
+                "Position",
+                help="Position of chunk within question results",
+                min_value=0
             )
-        }
+        },
+        use_container_width=True,
+        hide_index=False,
+        filters=True  # Enable filtering
     )
 
 def main():
