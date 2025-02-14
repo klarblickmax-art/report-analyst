@@ -63,7 +63,10 @@ class DocumentAnalyzer:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(DocumentAnalyzer, cls).__new__(cls)
+            # Initialize core attributes here
             cls._instance._initialized = False
+            cls._instance.question_set = "tcfd"  # Set default question set
+            cls._instance.questions = {}
         return cls._instance
     
     def __init__(self):
@@ -83,6 +86,9 @@ class DocumentAnalyzer:
         log_analysis_step(f"Storage path: {self.storage_path.resolve()}", "debug")
         log_analysis_step(f"Cache path: {self.cache_path.resolve()}", "debug")
         log_analysis_step(f"LLM cache path: {self.llm_cache_path.resolve()}", "debug")
+        
+        # Load questions
+        self.questions = self._load_questions()
         
         model_name = os.getenv("OPENAI_API_MODEL", "gpt-4-turbo-preview")
         log_analysis_step(f"Using model: {model_name}")
@@ -131,8 +137,6 @@ class DocumentAnalyzer:
             log_analysis_step(f"Error initializing OpenAI clients: {str(e)}", "error")
             raise
         
-        self.questions = {}
-        self.question_set_prefix = "tcfd"  # Default to tcfd
         self._initialized = True
 
     def _get_cache_key(self, file_path: str) -> str:
@@ -345,17 +349,17 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
             # Return default scores on error
             return [0.0] * len(chunks)
 
-    async def process_document(self, file_path: str, question_ids: List[int], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
+    async def process_document(self, file_path: str, selected_numbers: List[int], use_llm_scoring: bool = False, single_call: bool = True) -> AsyncGenerator[Dict, None]:
         """Process document and analyze questions.
         
         Args:
             file_path (str): Path to the document
-            question_ids (List[int]): List of question IDs to analyze
+            selected_numbers (List[int]): List of question numbers to analyze
             use_llm_scoring (bool): Whether to use LLM for scoring chunk relevance
             single_call (bool): If True, score all chunks in one LLM call
         """
         log_analysis_step(f"Starting document processing: {file_path}")
-        log_analysis_step(f"Processing questions: {question_ids}")
+        log_analysis_step(f"Processing questions: {selected_numbers}")
         log_analysis_step(f"LLM scoring enabled: {use_llm_scoring}")
         
         try:
@@ -426,199 +430,237 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
             yield {"status": "✓ Vector store ready"}
             
             # Process each question
-            for q_id in question_ids:
-                question_key = f"{self.question_set_prefix}_{q_id}"
-                if question_key not in self.questions:
-                    log_analysis_step(f"Skipping unknown question ID: {q_id}")
-                    continue
-                
-                question_data = self.questions[question_key]
-                log_analysis_step(f"Processing question {q_id} (key: {question_key})")
-                yield {"status": f"Analyzing question {q_id}"}
-                
+            for question_number in selected_numbers:
                 try:
-                    # Get relevant context using TOP_K=20
-                    docs_and_scores = vectorstore.similarity_search(question_data['text'], k=20)
-                    docs = [doc for doc, _ in docs_and_scores]
-                    scores = [score for _, score in docs_and_scores]
+                    question_data = self.get_question_by_number(question_number)
+                    if not question_data:
+                        continue
                     
-                    context = "\n".join(d.text for d in docs)
-                    log_analysis_step(f"Retrieved {len(docs)} relevant chunks for question {q_id}", "debug")
+                    log_analysis_step(f"Processing question {question_number} (key: {question_data['text']})")
+                    yield {"status": f"Analyzing question {question_number}"}
                     
-                    # Prepare chunks data for passing to frontend
-                    chunks_data = [{"text": d.text, "metadata": d.metadata, "relevance_score": float(s)} 
-                                 for d, s in docs_and_scores]
-                    
-                    # Add LLM-based relevance scoring if enabled
-                    if use_llm_scoring:
-                        log_analysis_step(f"Starting LLM-based relevance scoring for question {q_id}")
-                        yield {"status": f"Scoring chunk relevance for question {q_id}..."}
-                        
-                        computed_scores = await self.score_chunk_relevance_batch(
-                            question_data['text'],
-                            chunks_data,
-                            single_call=single_call
-                        )
-                        
-                        scored_chunks = [
-                            {**chunk, "computed_score": float(score)}
-                            for chunk, score in zip(chunks_data, computed_scores)
-                        ]
-                        
-                        chunks_data = scored_chunks
-                        log_analysis_step(f"Completed scoring {len(chunks_data)} chunks")
-                    else:
-                        log_analysis_step(f"Skipping LLM-based relevance scoring for question {q_id} (scoring is disabled)")
-                    
-                    # Sort chunks by computed_score
-                    if use_llm_scoring:
-                        chunks_data = sorted(
-                            chunks_data,
-                            key=lambda x: x.get('computed_score', 0.0),
-                            reverse=True  # Highest scores first
-                        )
-                        log_analysis_step(f"Sorted {len(chunks_data)} chunks by computed_score")
-                    else:
-                        # Sort by vector similarity score
-                        chunks_data = sorted(
-                            chunks_data,
-                            key=lambda x: x.get('relevance_score', 0.0),
-                            reverse=True  # Highest scores first
-                        )
-                        log_analysis_step(f"Sorted {len(chunks_data)} chunks by relevance_score")
-                    
-                    # Get LLM response with sorted chunks data
-                    messages = self.prompt_manager.get_analysis_messages(
-                        question=question_data['text'],
-                        context=context,
-                        guidelines=question_data['guidelines'],
-                        chunks_data=chunks_data  # Now sorted by relevance
-                    )
-                    
-                    # Convert messages to a single prompt for LlamaIndex OpenAI
-                    prompt = "\n\n".join([
-                        f"{msg['role'].upper()}: {msg['content']}"
-                        for msg in messages
-                    ])
-                    
-                    result = await self.llm.acomplete(prompt=prompt)
-                    log_analysis_step(f"Got LLM response for question {q_id}", "debug")
-                    
-                    # Extract JSON from response
                     try:
-                        result_text = result.text.strip()
+                        # Get relevant context using TOP_K=20
+                        docs_and_scores = vectorstore.similarity_search(question_data['text'], k=20)
+                        docs = [doc for doc, _ in docs_and_scores]
+                        scores = [score for _, score in docs_and_scores]
                         
-                        # Find the first { and last } to extract just the JSON object
-                        json_start = result_text.find('{')
-                        json_end = result_text.rfind('}') + 1
+                        context = "\n".join(d.text for d in docs)
+                        log_analysis_step(f"Retrieved {len(docs)} relevant chunks for question {question_number}", "debug")
                         
-                        if json_start >= 0 and json_end > json_start:
-                            result_text = result_text[json_start:json_end]
-                            # Clean up any potential trailing commas
-                            result_text = result_text.replace(',}', '}')
-                            # Remove any potential markdown code block markers
-                            result_text = result_text.replace('```json', '').replace('```', '')
+                        # Prepare chunks data for passing to frontend
+                        chunks_data = [{"text": d.text, "metadata": d.metadata, "relevance_score": float(s)} 
+                                     for d, s in docs_and_scores]
+                        
+                        # Add LLM-based relevance scoring if enabled
+                        if use_llm_scoring:
+                            log_analysis_step(f"Starting LLM-based relevance scoring for question {question_number}")
+                            yield {"status": f"Scoring chunk relevance for question {question_number}..."}
                             
-                            log_analysis_step(f"Extracted JSON: {result_text[:100]}...")  # Log first 100 chars
+                            computed_scores = await self.score_chunk_relevance_batch(
+                                question_data['text'],
+                                chunks_data,
+                                single_call=single_call
+                            )
                             
-                            result_json = json.loads(result_text)
+                            scored_chunks = [
+                                {**chunk, "computed_score": float(score)}
+                                for chunk, score in zip(chunks_data, computed_scores)
+                            ]
                             
-                            # Ensure we have all required keys
-                            required_keys = ["ANSWER", "SCORE", "EVIDENCE", "GAPS", "SOURCES"]
-                            missing_keys = [key for key in required_keys if key not in result_json]
-                            if missing_keys:
-                                raise ValueError(f"Missing required keys in response: {missing_keys}")
-                            
-                            # Validate evidence format
-                            for evidence in result_json["EVIDENCE"]:
-                                if not isinstance(evidence, dict) or "text" not in evidence or "chunk" not in evidence:
-                                    raise ValueError("Evidence items must be dictionaries with 'text' and 'chunk' keys")
-                            
-                            # Update the result JSON structure
-                            # Convert chunks_data to be JSON serializable
-                            serializable_chunks = []
-                            for chunk in chunks_data:
-                                serializable_chunk = {
-                                    "text": chunk["text"],
-                                    "metadata": dict(chunk["metadata"]),  # Convert metadata to dict
-                                    "relevance_score": float(chunk["relevance_score"]),
-                                    "computed_score": float(chunk.get("computed_score", 0.0))
-                                }
-                                serializable_chunks.append(serializable_chunk)
-
-                            result_dict = {
-                                "ANSWER": result_json["ANSWER"],
-                                "SCORE": result_json["SCORE"],
-                                "EVIDENCE": result_json["EVIDENCE"],
-                                "GAPS": result_json["GAPS"],
-                                "SOURCES": result_json["SOURCES"],
-                                "CHUNKS": serializable_chunks
-                            }
-
-                            yield {
-                                "question_number": q_id,
-                                "result": json.dumps(result_dict)  # Convert to JSON string before yielding
-                            }
+                            chunks_data = scored_chunks
+                            log_analysis_step(f"Completed scoring {len(chunks_data)} chunks")
                         else:
-                            raise ValueError("No valid JSON object found in response")
+                            log_analysis_step(f"Skipping LLM-based relevance scoring for question {question_number} (scoring is disabled)")
+                        
+                        # Sort chunks by computed_score
+                        if use_llm_scoring:
+                            chunks_data = sorted(
+                                chunks_data,
+                                key=lambda x: x.get('computed_score', 0.0),
+                                reverse=True  # Highest scores first
+                            )
+                            log_analysis_step(f"Sorted {len(chunks_data)} chunks by computed_score")
+                        else:
+                            # Sort by vector similarity score
+                            chunks_data = sorted(
+                                chunks_data,
+                                key=lambda x: x.get('relevance_score', 0.0),
+                                reverse=True  # Highest scores first
+                            )
+                            log_analysis_step(f"Sorted {len(chunks_data)} chunks by relevance_score")
+                        
+                        # Get LLM response with sorted chunks data
+                        messages = self.prompt_manager.get_analysis_messages(
+                            question=question_data['text'],
+                            context=context,
+                            guidelines=question_data['guidelines'],
+                            chunks_data=chunks_data  # Now sorted by relevance
+                        )
+                        
+                        # Convert messages to a single prompt for LlamaIndex OpenAI
+                        prompt = "\n\n".join([
+                            f"{msg['role'].upper()}: {msg['content']}"
+                            for msg in messages
+                        ])
+                        
+                        result = await self.llm.acomplete(prompt=prompt)
+                        log_analysis_step(f"Got LLM response for question {question_number}", "debug")
+                        
+                        # Extract JSON from response
+                        try:
+                            result_text = result.text.strip()
                             
-                    except json.JSONDecodeError as e:
-                        log_analysis_step(f"JSON decode error: {str(e)}\nResponse text: {result_text[:200]}", "error")
-                        raise
+                            # Find the first { and last } to extract just the JSON object
+                            json_start = result_text.find('{')
+                            json_end = result_text.rfind('}') + 1
+                            
+                            if json_start >= 0 and json_end > json_start:
+                                result_text = result_text[json_start:json_end]
+                                # Clean up any potential trailing commas
+                                result_text = result_text.replace(',}', '}')
+                                # Remove any potential markdown code block markers
+                                result_text = result_text.replace('```json', '').replace('```', '')
+                                
+                                log_analysis_step(f"Extracted JSON: {result_text[:100]}...")  # Log first 100 chars
+                                
+                                result_json = json.loads(result_text)
+                                
+                                # Ensure we have all required keys
+                                required_keys = ["ANSWER", "SCORE", "EVIDENCE", "GAPS", "SOURCES"]
+                                missing_keys = [key for key in required_keys if key not in result_json]
+                                if missing_keys:
+                                    raise ValueError(f"Missing required keys in response: {missing_keys}")
+                                
+                                # Validate evidence format
+                                for evidence in result_json["EVIDENCE"]:
+                                    if not isinstance(evidence, dict) or "text" not in evidence or "chunk" not in evidence:
+                                        raise ValueError("Evidence items must be dictionaries with 'text' and 'chunk' keys")
+                                
+                                # Update the result JSON structure
+                                # Convert chunks_data to be JSON serializable
+                                serializable_chunks = []
+                                for chunk in chunks_data:
+                                    serializable_chunk = {
+                                        "text": chunk["text"],
+                                        "metadata": dict(chunk["metadata"]),  # Convert metadata to dict
+                                        "relevance_score": float(chunk["relevance_score"]),
+                                        "computed_score": float(chunk.get("computed_score", 0.0))
+                                    }
+                                    serializable_chunks.append(serializable_chunk)
+
+                                result_dict = {
+                                    "ANSWER": result_json["ANSWER"],
+                                    "SCORE": result_json["SCORE"],
+                                    "EVIDENCE": result_json["EVIDENCE"],
+                                    "GAPS": result_json["GAPS"],
+                                    "SOURCES": result_json["SOURCES"],
+                                    "CHUNKS": serializable_chunks
+                                }
+
+                                result = {
+                                    'result': json.dumps(result_dict),
+                                    'question_text': question_data['text'],
+                                    'question_number': question_number
+                                }
+
+                                yield result
+                            else:
+                                raise ValueError("No valid JSON object found in response")
+                                
+                        except json.JSONDecodeError as e:
+                            log_analysis_step(f"JSON decode error: {str(e)}\nResponse text: {result_text[:200]}", "error")
+                            raise
+                        except Exception as e:
+                            log_analysis_step(f"Error processing result: {str(e)}", "error")
+                            raise
                     except Exception as e:
-                        log_analysis_step(f"Error processing result: {str(e)}", "error")
-                        raise
+                        error_msg = f"Error processing question {question_number}: {str(e)}"
+                        log_analysis_step(error_msg, "error")
+                        logger.error(f"Full error: {str(e)}", exc_info=True)
+                        yield {
+                            "question_number": question_number,
+                            "result": json.dumps({
+                                "ANSWER": f"Error: {error_msg}",
+                                "SCORE": 0,
+                                "EVIDENCE": [],
+                                "GAPS": [error_msg],
+                                "SOURCES": []
+                            }),
+                            "error": error_msg
+                        }
+                    
                 except Exception as e:
-                    error_msg = f"Error processing question {q_id}: {str(e)}"
-                    log_analysis_step(error_msg, "error")
-                    logger.error(f"Full error: {str(e)}", exc_info=True)
-                    yield {
-                        "question_number": q_id,
-                        "result": json.dumps({
-                            "ANSWER": f"Error: {error_msg}",
-                            "SCORE": 0,
-                            "EVIDENCE": [],
-                            "GAPS": [error_msg],
-                            "SOURCES": []
-                        })
-                    }
+                    logger.error(f"Error processing question {question_number}: {str(e)}")
+                    yield {"error": f"Error processing question {question_number}: {str(e)}"}
                     
         except Exception as e:
             log_analysis_step(f"Error processing document: {str(e)}", "error")
             yield {"error": f"Failed to process document: {str(e)}"}
 
     def _load_questions(self) -> dict:
-        """Load TCFD questions from YAML files"""
-        # Look in app/questionsets first, then try questionsets
+        """Load questions from YAML files"""
+        # Look for question set file in multiple possible locations
         possible_paths = [
-            Path(__file__).parent.parent / "questionsets" / "tcfd_questions.yaml",  # app/questionsets
-            Path("questionsets") / "tcfd_questions.yaml"  # questionsets in root
+            Path(__file__).parent.parent / "questionsets" / f"{self.question_set}_questions.yaml",  # app/questionsets
+            Path(__file__).parent.parent.parent / "questionsets" / f"{self.question_set}_questions.yaml",  # project root
+            Path.cwd() / "questionsets" / f"{self.question_set}_questions.yaml"  # current working directory
         ]
+        
+        log_analysis_step(f"Looking for {self.question_set}_questions.yaml in:")
+        for path in possible_paths:
+            log_analysis_step(f"- {path.resolve()}")
         
         yaml_file = None
         for path in possible_paths:
             if path.exists():
                 yaml_file = path
+                log_analysis_step(f"✓ Found questions file at: {path.resolve()}")
                 break
                 
         if not yaml_file:
-            log_analysis_step(f"Could not find questions file in any of: {[str(p) for p in possible_paths]}", "error")
+            log_analysis_step(f"Could not find questions file for {self.question_set} in any of: {[str(p) for p in possible_paths]}", "error")
             return {}
             
-        log_analysis_step(f"Loading questions from {yaml_file}", "debug")
-        
-        with open(yaml_file, 'r') as f:
-            config = yaml.safe_load(f)
-            questions = {}
+        try:
+            with open(yaml_file, 'r') as f:
+                config = yaml.safe_load(f)
+                log_analysis_step(f"Loaded YAML content: {str(config)[:200]}...")  # Show first 200 chars
+                
+                questions = {}
+                # Convert the questions list into a structured format
+                for q in config.get('questions', []):
+                    q_id = q.get('id', '')
+                    if q_id:
+                        questions[q_id] = {
+                            'text': q.get('text', ''),
+                            'guidelines': q.get('guidelines', '')
+                        }
+                        log_analysis_step(f"Added question {q_id}: {questions[q_id]['text'][:50]}...")
+                
+                log_analysis_step(f"✓ Loaded {len(questions)} questions for {self.question_set}")
+                log_analysis_step(f"Available question IDs: {list(questions.keys())}")
+                return questions
+        except Exception as e:
+            log_analysis_step(f"Error loading questions: {str(e)}", "error")
+            logger.exception("Full error:")  # This will log the full traceback
+            return {}
+
+    def get_question_by_number(self, number: int) -> Optional[Dict]:
+        """Get question data by its number."""
+        try:
+            # Convert number to the correct format (e.g., "tcfd_1")
+            question_id = f"{self.question_set}_{number}"
+            log_analysis_step(f"Looking for question ID: {question_id}")
+            log_analysis_step(f"Available questions: {list(self.questions.keys())}")
             
-            # Convert the questions list into a structured format
-            for q in config.get('questions', []):
-                q_id = q.get('id', '')
-                if q_id:
-                    questions[q_id] = {
-                        'text': q.get('text', ''),
-                        'guidelines': q.get('guidelines', '')
-                    }
-            
-            log_analysis_step(f"Loaded {len(questions)} questions", "debug")
-            return questions 
+            if question_id in self.questions:
+                log_analysis_step(f"✓ Found question {question_id}")
+                return self.questions[question_id]
+            else:
+                log_analysis_step(f"Question {number} (id: {question_id}) not found in question set {self.question_set}", "warning")
+                return None
+        except Exception as e:
+            log_analysis_step(f"Error getting question {number}: {str(e)}", "error")
+            logger.exception("Full error:")  # This will log the full traceback
+            return None 
