@@ -713,6 +713,71 @@ def main():
                 if question_set_data["description"]:
                     st.write(question_set_data["description"])
                 
+                # Add configuration section before questions
+                st.subheader("Analysis Configuration")
+                config_col1, config_col2, config_col3, config_col4, config_col5 = st.columns(5)
+
+                with config_col1:
+                    st.session_state.use_llm_scoring = st.checkbox(
+                        "Use LLM Scoring",
+                        value=st.session_state.get('use_llm_scoring', False),
+                        help="Enable LLM-based scoring for more accurate but slower analysis"
+                    )
+                    if st.session_state.use_llm_scoring:
+                        st.session_state.batch_scoring = st.checkbox(
+                            "Use Batch Scoring",
+                            value=st.session_state.get('batch_scoring', True),
+                            help="Score all chunks in one call (faster but may be less accurate)"
+                        )
+
+                with config_col2:
+                    default_model = os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo-1106")
+                    options = [
+                        'gpt-3.5-turbo-1106',
+                        'gpt-4o-mini',
+                        'gpt-4-0125-preview',
+                        'gpt-4-1106-preview'
+                    ]
+                    st.session_state.llm_model = st.selectbox(
+                        "LLM Model",
+                        options=options,
+                        index=options.index(default_model) if default_model in options else 0,
+                        help="Select which LLM model to use for analysis"
+                    )
+
+                with config_col3:
+                    chunk_size = st.number_input(
+                        "Chunk Size (words)",
+                        min_value=100,
+                        max_value=1000,
+                        value=st.session_state.get('chunk_size', 500),
+                        step=50,
+                        help="Number of words per text chunk"
+                    )
+                    st.session_state.chunk_size = chunk_size
+
+                with config_col4:
+                    overlap = st.number_input(
+                        "Chunk Overlap (tokens)",
+                        min_value=0,
+                        max_value=100,
+                        value=st.session_state.get('overlap', 20),
+                        step=5,
+                        help="Number of overlapping tokens between chunks"
+                    )
+                    st.session_state.overlap = overlap
+
+                with config_col5:
+                    top_k = st.number_input(
+                        "Top-K Chunks",
+                        min_value=1,
+                        max_value=20,
+                        value=st.session_state.get('top_k', 5),
+                        step=1,
+                        help="Number of most relevant chunks to consider"
+                    )
+                    st.session_state.top_k = top_k
+
                 # Question selection
                 st.subheader("Select Questions for Analysis")
                 
@@ -743,14 +808,24 @@ def main():
                         with st.spinner("Analyzing document..."):
                             file_path = save_uploaded_file(st.session_state.uploaded_file)
                             if file_path:
+                                # Update analyzer parameters before processing
+                                analyzer.analyzer.update_parameters(
+                                    chunk_size=st.session_state.chunk_size,
+                                    chunk_overlap=st.session_state.overlap,
+                                    top_k=st.session_state.top_k
+                                )
+                                # Update LLM model
+                                analyzer.analyzer.update_llm_model(st.session_state.llm_model)
+                                
+                                # Run analysis with configured parameters
                                 asyncio.run(analyze_document_and_display(
-                                    analyzer,
-                                    file_path,
-                                    questions,
-                                    selected_questions,
-                                    st.session_state.use_llm_scoring,
-                                    st.session_state.single_call,
-                                    st.session_state.force_recompute
+                                    analyzer=analyzer,
+                                    file_path=file_path,
+                                    questions=questions,
+                                    selected_questions=selected_questions,
+                                    use_llm_scoring=st.session_state.use_llm_scoring,
+                                    single_call=st.session_state.get('batch_scoring', True),
+                                    force_recompute=st.session_state.get('force_recompute', False)
                                 ))
                 
                 # Display results if available

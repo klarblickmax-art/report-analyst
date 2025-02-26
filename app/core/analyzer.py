@@ -59,14 +59,11 @@ def compute_params_hash(params: Dict) -> str:
 
 class DocumentAnalyzer:
     _instance = None
+    _initialized = False
     
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(DocumentAnalyzer, cls).__new__(cls)
-            # Initialize core attributes here
-            cls._instance._initialized = False
-            cls._instance.question_set = "tcfd"  # Set default question set
-            cls._instance.questions = {}
         return cls._instance
     
     def __init__(self):
@@ -74,7 +71,7 @@ class DocumentAnalyzer:
             return
             
         self.prompt_manager = PromptManager()
-        # Use absolute paths for storage, relative to project root
+        # Use absolute paths for storage
         self.storage_path = Path(__file__).parent.parent.parent / "storage"
         self.cache_path = self.storage_path / "cache"
         self.llm_cache_path = self.storage_path / "llm_cache"
@@ -87,16 +84,18 @@ class DocumentAnalyzer:
         log_analysis_step(f"Cache path: {self.cache_path.resolve()}", "debug")
         log_analysis_step(f"LLM cache path: {self.llm_cache_path.resolve()}", "debug")
         
-        # Load questions
+        # Set default question set
+        self.question_set = "tcfd"
         self.questions = self._load_questions()
         
-        model_name = os.getenv("OPENAI_API_MODEL", "gpt-4-turbo-preview")
-        log_analysis_step(f"Using model: {model_name}")
+        # Use model from environment variables as default
+        self.default_model = os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo-1106")
+        log_analysis_step(f"Using default model from env: {self.default_model}")
         
         try:
             # Initialize LLM with caching
             self.llm = OpenAI(
-                model=model_name,
+                model=self.default_model,
                 api_key=os.getenv("OPENAI_API_KEY"),
                 api_base=os.getenv("OPENAI_API_BASE"),
                 cache_dir=str(self.llm_cache_path),
@@ -125,7 +124,8 @@ class DocumentAnalyzer:
             # Cache parameters
             self.chunk_params = {
                 "chunk_size": 500,
-                "chunk_overlap": 20
+                "chunk_overlap": 20,
+                "top_k": 5
             }
             
             self.embedding_params = {
@@ -142,14 +142,12 @@ class DocumentAnalyzer:
     def _get_cache_key(self, file_path: str) -> str:
         """Generate a unique cache key for a file based on its path and content hash."""
         try:
-            # Use file content hash instead of modification time
             file_hash = compute_file_hash(file_path)
-            # Use a shorter hash for parameters
-            params_str = f"{self.chunk_params['chunk_size']}_{self.chunk_params['chunk_overlap']}"
-            return f"{Path(file_path).stem}_{file_hash[:8]}_{params_str}"
+            # Include question set and all parameters in cache key
+            params_str = f"{self.chunk_params['chunk_size']}_{self.chunk_params['chunk_overlap']}_{self.chunk_params['top_k']}"
+            return f"{Path(file_path).stem}_{file_hash[:8]}_{self.question_set}_{params_str}"
         except Exception as e:
             logger.warning(f"[ANALYSIS] Cache ERROR: Failed to generate cache key: {e}")
-            # Fallback to a simple key
             return f"{Path(file_path).stem}_fallback"
 
     def _get_vector_store_collection_name(self, cache_key: str) -> str:
@@ -276,17 +274,24 @@ Output only the numeric score (0.0-1.0):""")
             return 0.0
 
     async def score_chunk_relevance_batch(self, question: str, chunks: List[Dict], single_call: bool = True) -> List[float]:
-        """Score a batch of chunks using LLM."""
+        """Score a batch of chunks using LLM.
+        
+        Args:
+            question: The question being analyzed
+            chunks: List of chunks to score
+            single_call: If True, score all chunks in one API call. If False, score each chunk individually.
+        """
         try:
-            # Format all chunks into a single prompt for batch scoring
-            chunks_text = "\n\n".join([
-                f"[CHUNK {i+1}]\n{chunk['text']}"
-                for i, chunk in enumerate(chunks)
-            ])
-            
-            response = await self.llm.acomplete(prompt=f"""As a senior equity analyst with expertise in climate science evaluating a company's sustainability report, you are tasked with evaluating text fragments for their usefulness in answering specific TCFD questions.
+            if single_call:
+                # Batch scoring - all chunks in one call
+                chunks_text = "\n\n".join([
+                    f"[CHUNK {i+1}]\n{chunk['text']}"
+                    for i, chunk in enumerate(chunks)
+                ])
+                
+                response = await self.llm.acomplete(prompt=f"""As a senior equity analyst with expertise in climate science evaluating a company's sustainability report, you are tasked with evaluating text fragments for their usefulness in answering specific TCFD questions.
 
-Your task is to score the relevance and quality of evidence in each text fragment. Consider:
+Your task is to score the relevance and quality of evidence in each text fragment marked as [CHUNK X]. Consider:
 
 1. Specificity and Concreteness:
    - Quantitative data and specific metrics (highest value)
@@ -323,30 +328,29 @@ Question: {question}
 Text fragments to evaluate:
 {chunks_text}
 
-Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
-
-            scores_text = response.text.strip()
-            
-            # Extract JSON array from response
-            start_idx = scores_text.find('[')
-            end_idx = scores_text.rfind(']') + 1
-            if start_idx >= 0 and end_idx > start_idx:
-                scores_text = scores_text[start_idx:end_idx]
-                scores = json.loads(scores_text)
+Output only the scores, one per line, in order:""")
                 
-                # Validate scores
-                if not isinstance(scores, list) or len(scores) != len(chunks):
-                    raise ValueError(f"Invalid scores format: expected {len(chunks)} scores, got {len(scores) if isinstance(scores, list) else 'non-list'}")
+                # Parse scores from response
+                try:
+                    scores = [float(score.strip()) for score in response.text.strip().split('\n')]
+                    if len(scores) != len(chunks):
+                        raise ValueError(f"Got {len(scores)} scores for {len(chunks)} chunks")
+                    return scores
+                except Exception as e:
+                    log_analysis_step(f"Error parsing batch scores: {str(e)}", "error")
+                    return [0.0] * len(chunks)
                 
-                # Ensure all scores are floats in [0,1]
-                scores = [max(0.0, min(1.0, float(score))) for score in scores]
-                return scores
             else:
-                raise ValueError("No valid JSON array found in response")
+                # Individual scoring - one API call per chunk
+                scores = []
+                for i, chunk in enumerate(chunks):
+                    score = await self.score_chunk_relevance(question, chunk['text'])
+                    scores.append(score)
+                    log_analysis_step(f"Scored chunk {i+1}/{len(chunks)}: {score:.2f}")
+                return scores
                 
         except Exception as e:
             log_analysis_step(f"Error in batch scoring: {str(e)}", "error")
-            # Return default scores on error
             return [0.0] * len(chunks)
 
     def _get_answers_cache_path(self, file_path: str) -> Path:
@@ -471,16 +475,11 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
             # Process each question
             for question_number in selected_numbers:
                 try:
-                    # Check if we have a cached answer and not forcing recompute
-                    answer_key = f"{self.question_set}_{question_number}"
-                    if not force_recompute and answer_key in cached_answers:
-                        log_analysis_step(f"Using cached answer for question {question_number}")
-                        yield cached_answers[answer_key]
-                        continue
-                    
+                    # Get question data using the helper method
                     question_data = self.get_question_by_number(question_number)
                     if not question_data:
-                        continue
+                        log_analysis_step(f"Question {question_number} not found in set {self.question_set}", "error")
+                        raise ValueError(f"Invalid question number: {question_number}")
                     
                     log_analysis_step(f"Processing question {question_number} (key: {question_data['text']})")
                     yield {"status": f"Analyzing question {question_number}"}
@@ -611,7 +610,7 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
                                 }
 
                                 # Store result in new answers
-                                new_answers[answer_key] = result
+                                new_answers[f"{self.question_set}_{question_number}"] = result
                                 yield result
                             else:
                                 raise ValueError("No valid JSON object found in response")
@@ -620,21 +619,20 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
                             log_analysis_step(f"JSON decode error: {str(e)}\nResponse text: {result_text[:200]}", "error")
                             raise
                         except Exception as e:
-                            log_analysis_step(f"Error processing result: {str(e)}", "error")
-                            raise
+                            error_msg = f"Error processing result: {str(e)}"
+                            log_analysis_step(error_msg, "error")
+                            logger.error(f"Full error: {str(e)}", exc_info=True)
+                            yield {
+                                "question_number": question_number,
+                                "question_text": question_data['text'] if question_data else "Unknown question",
+                                "error": error_msg
+                            }
                     except Exception as e:
                         error_msg = f"Error processing question {question_number}: {str(e)}"
-                        log_analysis_step(error_msg, "error")
-                        logger.error(f"Full error: {str(e)}", exc_info=True)
+                        log_analysis_step(error_msg, "error", exc_info=True)
                         yield {
                             "question_number": question_number,
-                            "result": json.dumps({
-                                "ANSWER": f"Error: {error_msg}",
-                                "SCORE": 0,
-                                "EVIDENCE": [],
-                                "GAPS": [error_msg],
-                                "SOURCES": []
-                            }),
+                            "question_text": question_data['text'] if question_data else "Unknown question",
                             "error": error_msg
                         }
                     
@@ -648,8 +646,8 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
                 self._save_cached_answers(file_path, cached_answers)
             
         except Exception as e:
-            log_analysis_step(f"Error processing document: {str(e)}", "error")
-            yield {"error": f"Failed to process document: {str(e)}"}
+            log_analysis_step(f"Error analyzing document: {str(e)}", "error", exc_info=True)
+            raise
 
     def _load_questions(self) -> dict:
         """Load questions from YAML files"""
@@ -702,18 +700,65 @@ Output only the scores in a JSON array, like: [0.8, 0.3, 0.0]""")
     def get_question_by_number(self, number: int) -> Optional[Dict]:
         """Get question data by its number."""
         try:
-            # Convert number to the correct format (e.g., "tcfd_1")
-            question_id = f"{self.question_set}_{number}"
-            log_analysis_step(f"Looking for question ID: {question_id}")
-            log_analysis_step(f"Available questions: {list(self.questions.keys())}")
-            
-            if question_id in self.questions:
-                log_analysis_step(f"✓ Found question {question_id}")
-                return self.questions[question_id]
-            else:
-                log_analysis_step(f"Question {number} (id: {question_id}) not found in question set {self.question_set}", "warning")
-                return None
+            question_key = f"{self.question_set}_{number}"
+            return self.questions.get(question_key)
         except Exception as e:
             log_analysis_step(f"Error getting question {number}: {str(e)}", "error")
-            logger.exception("Full error:")  # This will log the full traceback
-            return None 
+            logger.exception("Full error:")
+            return None
+
+    def update_parameters(self, chunk_size: int, chunk_overlap: int, top_k: int):
+        """Update analysis parameters and recreate text splitter."""
+        self.chunk_params = {
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "top_k": top_k
+        }
+        
+        # Recreate text splitter with new parameters
+        self.text_splitter = SentenceSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        ) 
+
+    def update_llm_model(self, model_name: str):
+        """Update the LLM model."""
+        log_analysis_step(f"Updating LLM model to: {model_name}")
+        
+        # Initialize LLM with caching
+        self.llm = OpenAI(
+            model=model_name,
+            api_key=os.getenv("OPENAI_API_KEY"),
+            api_base=os.getenv("OPENAI_API_BASE"),
+            cache_dir=str(self.llm_cache_path),
+        )
+
+    def get_all_cached_answers(self, question_set: str) -> Dict:
+        """Get all cached answers for a given question set"""
+        cache_path = self.cache_path  # Use analyzer's cache path
+        
+        if not cache_path.exists():
+            log_analysis_step(f"Cache directory not found: {cache_path}")
+            return {}
+        
+        log_analysis_step(f"Looking for cached answers in: {cache_path}")
+        all_answers = {}
+        
+        # Include configuration in cache file pattern
+        config_suffix = self._get_config_suffix()
+        pattern = f"*_{question_set}{config_suffix}_answers.json"
+        log_analysis_step(f"Searching for files matching: {pattern}")
+        
+        try:
+            for cache_file in cache_path.glob(pattern):
+                try:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached_data = json.load(f)
+                    all_answers.update(cached_data)
+                except Exception as e:
+                    log_analysis_step(f"Error loading cache file {cache_file}: {str(e)}", "warning")
+                    continue
+        except Exception as e:
+            log_analysis_step(f"Error searching cache files: {str(e)}", "error")
+        
+        return all_answers 
