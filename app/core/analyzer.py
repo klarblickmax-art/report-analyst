@@ -140,12 +140,14 @@ class DocumentAnalyzer:
         self._initialized = True
 
     def _get_cache_key(self, file_path: str) -> str:
-        """Generate a unique cache key for a file based on its path and content hash."""
+        """Generate a unique cache key based on file and all analysis parameters."""
         try:
-            file_hash = compute_file_hash(file_path)
-            # Include question set and all parameters in cache key
-            params_str = f"{self.chunk_params['chunk_size']}_{self.chunk_params['chunk_overlap']}_{self.chunk_params['top_k']}"
-            return f"{Path(file_path).stem}_{file_hash[:8]}_{self.question_set}_{params_str}"
+            params_str = (f"cs{self.chunk_params['chunk_size']}_"
+                         f"ov{self.chunk_params['chunk_overlap']}_"
+                         f"tk{self.chunk_params['top_k']}_"
+                         f"m{self.llm.model}_"  # Include LLM model
+                         f"qs{self.question_set}")  # Include question set
+            return f"{Path(file_path).stem}_{params_str}"
         except Exception as e:
             logger.warning(f"[ANALYSIS] Cache ERROR: Failed to generate cache key: {e}")
             return f"{Path(file_path).stem}_fallback"
@@ -361,29 +363,36 @@ Output only the scores, one per line, in order:""")
         return self.cache_path / f"{cache_key}_answers.json"
 
     def _load_cached_answers(self, file_path: str) -> Dict:
-        """Load cached answers for a report if they exist."""
+        """Load cached answers using the parameter-based format"""
         try:
-            cache_path = self._get_answers_cache_path(file_path)
+            cache_key = self._get_cache_key(file_path)
+            cache_path = self.cache_path / f"{cache_key}.json"
+            
             if cache_path.exists():
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     cached_data = json.load(f)
-                log_analysis_step(f"✓ Loaded {len(cached_data)} cached answers for question set {self.question_set}")
+                logger.info(f"[ANALYSIS] ✓ Cache HIT: Loaded answers from {cache_path}")
                 return cached_data
-            log_analysis_step(f"No cached answers found for question set {self.question_set}")
+            
+            logger.info(f"[ANALYSIS] Cache MISS: No cached answers found at {cache_path}")
             return {}
+            
         except Exception as e:
-            log_analysis_step(f"Error loading cached answers for question set {self.question_set}: {str(e)}", "warning")
+            logger.warning(f"[ANALYSIS] Cache ERROR: Failed to load cached answers: {e}")
             return {}
 
-    def _save_cached_answers(self, file_path: str, answers: Dict):
-        """Save answers to cache."""
+    def _save_cached_answers(self, file_path: str, answers: Dict) -> None:
+        """Save answers using the parameter-based format"""
         try:
-            cache_path = self._get_answers_cache_path(file_path)
+            cache_key = self._get_cache_key(file_path)
+            cache_path = self.cache_path / f"{cache_key}.json"
+            
             with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(answers, f)
-            log_analysis_step(f"✓ Saved {len(answers)} answers for question set {self.question_set}")
+                json.dump(answers, f, indent=2)
+            logger.info(f"[ANALYSIS] ✓ Cache SAVE: Saved answers to {cache_path}")
+            
         except Exception as e:
-            log_analysis_step(f"Error saving answers for question set {self.question_set}: {str(e)}", "warning")
+            logger.warning(f"[ANALYSIS] Cache ERROR: Failed to save answers: {e}")
 
     async def process_document(self, file_path: str, selected_numbers: List[int], use_llm_scoring: bool = False, single_call: bool = True, force_recompute: bool = False) -> AsyncGenerator[Dict, None]:
         """Process document and analyze questions.
@@ -398,6 +407,7 @@ Output only the scores, one per line, in order:""")
         log_analysis_step(f"Starting document processing: {file_path}")
         log_analysis_step(f"Processing questions: {selected_numbers}")
         log_analysis_step(f"Force recompute: {force_recompute}")
+        log_analysis_step(f"Using LLM model: {self.llm.model}")
         
         try:
             # Initial status
@@ -735,19 +745,18 @@ Output only the scores, one per line, in order:""")
 
     def get_all_cached_answers(self, question_set: str) -> Dict:
         """Get all cached answers for a given question set"""
-        cache_path = self.cache_path  # Use analyzer's cache path
+        cache_path = self.cache_path
         
         if not cache_path.exists():
-            log_analysis_step(f"Cache directory not found: {cache_path}")
+            logger.warning(f"Cache directory not found: {cache_path}")
             return {}
         
-        log_analysis_step(f"Looking for cached answers in: {cache_path}")
+        logger.info(f"[ANALYSIS] Looking for cached answers in: {cache_path}")
         all_answers = {}
         
-        # Include configuration in cache file pattern
-        config_suffix = self._get_config_suffix()
-        pattern = f"*_{question_set}{config_suffix}_answers.json"
-        log_analysis_step(f"Searching for files matching: {pattern}")
+        # Use parameter-based pattern
+        pattern = f"*_cs{self.chunk_params['chunk_size']}_ov{self.chunk_params['chunk_overlap']}_tk{self.chunk_params['top_k']}*.json"
+        logger.info(f"[ANALYSIS] Searching for files matching: {pattern}")
         
         try:
             for cache_file in cache_path.glob(pattern):
@@ -755,10 +764,16 @@ Output only the scores, one per line, in order:""")
                     with open(cache_file, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
                     all_answers.update(cached_data)
+                    logger.info(f"[ANALYSIS] Loaded answers from {cache_file.name}")
                 except Exception as e:
-                    log_analysis_step(f"Error loading cache file {cache_file}: {str(e)}", "warning")
+                    logger.warning(f"Error loading cache file {cache_file}: {str(e)}")
                     continue
         except Exception as e:
-            log_analysis_step(f"Error searching cache files: {str(e)}", "error")
+            logger.error(f"Error searching cache files: {str(e)}")
         
         return all_answers 
+
+    def update_question_set(self, question_set: str):
+        """Update the question set and reload questions."""
+        self.question_set = question_set
+        self.questions = self._load_questions() 
