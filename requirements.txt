@@ -180,7 +180,6 @@ pytz==2025.1
 PyYAML==6.0.1
 referencing==0.36.2
 regex==2024.11.6
--e git+ssh://git@github.com/climateandtech/report-finder.git@3b90b7e7bdc16c6628d6aa68d927ff1f83863bc7#egg=report_finder
 requests==2.32.3
 requests-oauthlib==2.0.0
 requests-toolbelt==1.0.0
