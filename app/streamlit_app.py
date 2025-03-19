@@ -68,6 +68,10 @@ question_sets = {
     "s4m": {
         "name": "S4M Questions",
         "description": "Sustainability for Management questions"
+    },
+    "lucia": {
+        "name": "Lucia Sustainability Report Analysis",
+        "description": "Comprehensive question set for analyzing sustainability reports based on Lucia criteria"
     }
 }
 
