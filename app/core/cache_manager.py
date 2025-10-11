@@ -114,7 +114,20 @@ class CacheManager:
                 UNIQUE(question_analysis_id, document_chunk_id)
             )
             """)
-
+            
+            # Create vector cache table for storing embeddings
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS vector_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT,
+                chunk_text TEXT,
+                embedding BLOB,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(file_path, chunk_text)
+            )
+            """)
+            
         finally:
             conn.close()
 
@@ -475,8 +488,9 @@ class CacheManager:
                         continue
                         
                     try:
-                        # Convert embedding to bytes
-                        embedding_bytes = chunk['embedding'].tobytes()
+                        # Convert embedding to bytes, preserving dtype
+                        embedding_array = np.array(chunk['embedding'], dtype=np.float32)
+                        embedding_bytes = embedding_array.tobytes()
                         
                         # Prepare chunk data
                         chunk_data.append((
@@ -527,13 +541,13 @@ class CacheManager:
                 chunks = []
                 for row in conn.execute("""
                     SELECT chunk_text, embedding, metadata
-                    FROM vector_cache
+                    FROM document_chunks
                     WHERE file_path = ?
                 """, (str(file_path),)):
                     chunks.append({
                         'text': row[0],
                         'embedding': np.frombuffer(row[1], dtype=np.float32) if row[1] else None,
-                        'metadata': json.loads(row[2])
+                        'metadata': json.loads(row[2]) if row[2] else {}
                     })
                 logger.info(f"Retrieved {len(chunks)} vectors for {file_path}")
                 return chunks

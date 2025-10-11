@@ -66,9 +66,9 @@ def test_save_and_get_analysis(temp_db):
     cached = temp_db.get_analysis(file_path, config, [question_id])
     
     assert question_id in cached
-    assert cached[question_id]["ANSWER"] == "Test answer"
-    assert cached[question_id]["SCORE"] == 7
-    assert len(cached[question_id]["EVIDENCE"]) == 2
+    assert cached[question_id]["result"]["ANSWER"] == "Test answer"
+    assert cached[question_id]["result"]["SCORE"] == 7
+    assert len(cached[question_id]["result"]["EVIDENCE"]) == 2
 
 def test_save_and_get_vectors(temp_db):
     """Test saving and retrieving vector embeddings"""

@@ -126,12 +126,12 @@ def test_load_question_set(report_analyzer, test_env):
         ]
     }
     
-    with patch('yaml.safe_load', return_value=test_questions):
-        question_set = report_analyzer.load_question_set('tcfd')
-        assert 'questions' in question_set
-        assert len(question_set['questions']) == 2
-        assert 'tcfd_1' in question_set['questions']
-        assert 'tcfd_2' in question_set['questions']
+    # Test with actual TCFD questions (not mocked)
+    question_set = report_analyzer.load_question_set('tcfd')
+    assert 'questions' in question_set
+    assert len(question_set['questions']) == 11  # TCFD has 11 questions
+    assert 'tcfd_1' in question_set['questions']
+    assert 'tcfd_11' in question_set['questions']
 
 @pytest.mark.asyncio
 async def test_analyze_document(report_analyzer, test_env):
