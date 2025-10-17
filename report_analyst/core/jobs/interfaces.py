@@ -167,7 +167,7 @@ class AnalysisJobDefinition(JobDefinition):
         model_name: str = "gpt-4o-mini",
         use_search_backend: bool = False,
         configuration: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs,
     ):
 
         super().__init__(
@@ -181,7 +181,7 @@ class AnalysisJobDefinition(JobDefinition):
                 "use_search_backend": use_search_backend,
                 "configuration": configuration or {},
             },
-            **kwargs
+            **kwargs,
         )
 
     @property
