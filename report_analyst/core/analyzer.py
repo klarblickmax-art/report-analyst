@@ -74,7 +74,7 @@ else:
     elif default_model.startswith("gpt-") and not openai_key:
         logger.warning(f"Default model is {default_model} but no OPENAI_API_KEY is available")
         if gemini_key:
-            default_model = "gemini-pro"
+            default_model = "gemini-1.5-flash"
             logger.info(f"Switching default model to {default_model}")
         else:
             logger.error("No valid API keys available for any models")
