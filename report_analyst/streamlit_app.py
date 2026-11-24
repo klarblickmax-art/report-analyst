@@ -11,6 +11,14 @@ import traceback
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+# Workaround: NLTK >= 3.10 refuses group-writable data folders,
+# which Streamlit Cloud creates by default.
+os.umask(0o022)
+_NLTK_DIR = Path.home() / "nltk_data_private"
+_NLTK_DIR.mkdir(parents=True, exist_ok=True)
+_NLTK_DIR.chmod(0o755)
+os.environ.setdefault("NLTK_DATA", str(_NLTK_DIR))
+
 import numpy as np
 import pandas as pd
 import streamlit as st
